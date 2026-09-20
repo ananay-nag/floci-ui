@@ -309,7 +309,7 @@ function TopbarSearch() {
         }
         const urlSearch = searchParams.get('search') ?? ''
         setDraft(urlSearch)
-    }, [location.pathname])
+    }, [location.pathname, searchParams])
 
     /** Focus on `/` when no other input/textarea/select is active. */
     useEffect(() => {
