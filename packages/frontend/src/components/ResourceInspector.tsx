@@ -1,17 +1,24 @@
 import {useState} from 'react'
 import { K8sEngineDetails } from "@/features/k8s/K8sEngineDetails";
+import { LogsExplorerPanel } from "@/components/LogsExplorerPanel";
+import { LogsQueryPanel } from "@/components/LogsQueryPanel";
+import type { CloudProvider } from "@/types/cloud";
 import type { CloudResource, StorageObject } from "@/types/resource";
 import {formatBytes} from "@/lib/format";
 
 interface ResourceInspectorProps {
   resource?: CloudResource;
   object?: StorageObject;
+  cloud?: CloudProvider;
+  runtimeReachable?: boolean;
   serviceName?: string;
 }
 
 export function ResourceInspector({
   resource,
   object,
+  cloud,
+  runtimeReachable,
   serviceName,
 }: ResourceInspectorProps) {
   if (!resource) {
@@ -65,6 +72,7 @@ export function ResourceInspector({
   const isK8sEngine = resource.service === "k8s" || resource.type === "cluster";
   const isLambda =
     resource.service === "serverless" || resource.type === "lambda";
+  const isLogGroup = resource.cloud === "aws" && (resource.service === "logs" || resource.type === "log-group");
 
   return (
     <aside className="resource-inspector">
@@ -183,6 +191,12 @@ export function ResourceInspector({
         {JSON.stringify(resource.metadata, null, 2)}
       </pre>
       <MetadataPanel metadata={resource.metadata} />
+      {isLogGroup && cloud && (
+        <>
+          <LogsQueryPanel cloud={cloud} logGroupName={resource.id} runtimeReachable={runtimeReachable ?? false} />
+          <LogsExplorerPanel cloud={cloud} resource={resource} runtimeReachable={runtimeReachable ?? false} />
+        </>
+      )}
     </aside>
   );
 }

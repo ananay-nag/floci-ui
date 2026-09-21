@@ -34,7 +34,6 @@ import type { CloudResource, StorageObject } from "@/types/resource";
 import type { ServiceSchema } from "@/types/schema";
 import { ServerlessInvokePanel } from "@/components/ServerlessInvokePanel";
 import { dataExplorerPath } from "@/lib/dataExplorer";
-import { LogsExplorerPanel } from "@/components/LogsExplorerPanel";
 import { DatabaseSnapshotsPanel } from "@/components/DatabaseSnapshotsPanel";
 import { CreateRdsInstanceForm } from "@/components/CreateRdsInstanceForm";
 import { AppConfigPanel } from "@/components/AppConfigPanel";
@@ -506,6 +505,8 @@ export function DynamicResourceView({
           <ResourceInspector
             resource={activeSelected}
             object={selectedObject}
+            cloud={cloud}
+            runtimeReachable={canUseRuntime}
             serviceName={schema.displayName}
           />
         )}
@@ -536,13 +537,6 @@ export function DynamicResourceView({
       )}
       {service === "serverless" && (
         <ServerlessInvokePanel
-          cloud={cloud}
-          resource={activeSelected}
-          runtimeReachable={canUseRuntime}
-        />
-      )}
-      {service === "logs" && cloud === "aws" && (
-        <LogsExplorerPanel
           cloud={cloud}
           resource={activeSelected}
           runtimeReachable={canUseRuntime}

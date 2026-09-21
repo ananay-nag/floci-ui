@@ -23,6 +23,8 @@ import type {
     DatabaseSnapshot,
     KubernetesFargateProfile,
     KubernetesNodegroup,
+    LogsInsightsQueryInput,
+    LogsInsightsQueryResult,
     NoSqlItem,
     ResourceQuery,
     ServerlessInvokeResult,
@@ -427,6 +429,12 @@ async invokeResource(
         const adapter = this.requireAdapter(cloud, 'database')
         if (!adapter.querySql) throw new NotSupportedError(`SQL query is not supported for ${cloud}/database`)
         return adapter.querySql(serverId, connection, query)
+    }
+
+    async queryLogs(cloud: CloudProvider, logGroupName: string, input: LogsInsightsQueryInput): Promise<LogsInsightsQueryResult> {
+        const adapter = this.requireAdapter(cloud, 'logs')
+        if (!adapter.queryLogs) throw new NotSupportedError(`Logs Insights query is not supported for ${cloud}/logs`)
+        return adapter.queryLogs(logGroupName, input)
     }
 
     async listNoSqlItems(cloud: CloudProvider, resourceId: string): Promise<NoSqlItem[]> {
