@@ -276,13 +276,66 @@ describe('AwsServerlessAdapter', () => {
             expect(triggers[2].details.prefix).toBe('uploads/')
         })
 
-        test('creates S3 trigger and updates bucket notification configuration', async () => {
-            const {client: lambdaClient} = stubLambda(() => ({
-                Configuration: {
-                    FunctionName: 'hello',
-                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+        test('lists ESM triggers following pagination markers', async () => {
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'ListEventSourceMappingsCommand') {
+                    const marker = (cmd as {input: {Marker?: string}}).input.Marker
+                    if (!marker) {
+                        return {
+                            EventSourceMappings: [
+                                {
+                                    UUID: 'esm-page-1',
+                                    EventSourceArn: 'arn:aws:sqs:us-east-1:000000000000:queue-1',
+                                    State: 'Enabled',
+                                },
+                            ],
+                            NextMarker: 'marker-2',
+                        }
+                    }
+                    return {
+                        EventSourceMappings: [
+                            {
+                                UUID: 'esm-page-2',
+                                EventSourceArn: 'arn:aws:sqs:us-east-1:000000000000:queue-2',
+                                State: 'Enabled',
+                            },
+                        ],
+                    }
+                }
+                return {}
+            })
+
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}}) {
+                    if (cmd.constructor.name === 'ListBucketsCommand') {
+                        return {Buckets: []}
+                    }
+                    return {}
                 },
-            }))
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            const triggers = await adapter.listLambdaTriggers('hello')
+
+            expect(triggers).toHaveLength(2)
+            expect(triggers[0].id).toBe('esm-page-1')
+            expect(triggers[1].id).toBe('esm-page-2')
+        })
+
+        test('creates S3 trigger with AddPermission and updates bucket notification configuration', async () => {
+            let addPermissionInput: unknown = null
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'AddPermissionCommand') {
+                    addPermissionInput = (cmd as {input: unknown}).input
+                    return {}
+                }
+                return {
+                    Configuration: {
+                        FunctionName: 'hello',
+                        FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                    },
+                }
+            })
 
             let putNotificationInput: unknown = null
             const s3Client = {
@@ -311,6 +364,12 @@ describe('AwsServerlessAdapter', () => {
             expect(created.sourceName).toBe('test-bucket')
             expect(created.details.prefix).toBe('raw/')
             expect(created.details.suffix).toBe('.json')
+            expect(addPermissionInput).toMatchObject({
+                FunctionName: 'hello',
+                Action: 'lambda:InvokeFunction',
+                Principal: 's3.amazonaws.com',
+                SourceArn: 'arn:aws:s3:::test-bucket',
+            })
             expect(putNotificationInput).not.toBeNull()
         })
 
@@ -356,7 +415,21 @@ describe('AwsServerlessAdapter', () => {
             })
         })
 
-        test('creates SQS trigger with queue resolution', async () => {
+        test('fails to create DynamoDB trigger if stream ARN is missing', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({}))
+            const dynamoClient = {
+                async send() {
+                    return {Table: {LatestStreamArn: undefined}}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, undefined as never, dynamoClient)
+            await expect(
+                adapter.createLambdaTrigger('hello', {type: 'dynamodb', tableName: 'users'}),
+            ).rejects.toThrow('DynamoDB stream is not enabled')
+        })
+
+        test('creates SQS trigger with queue name resolution via GetQueueUrl and GetQueueAttributes', async () => {
             let createEsmInput: unknown = null
             const {client: lambdaClient} = stubLambda((cmd) => {
                 if (cmd.constructor.name === 'CreateEventSourceMappingCommand') {
@@ -371,35 +444,57 @@ describe('AwsServerlessAdapter', () => {
             })
 
             const sqsClient = {
-                async send() {
-                    return {
-                        Attributes: {
-                            QueueArn: 'arn:aws:sqs:us-east-1:000000000000:order-events',
-                        },
+                async send(cmd: {constructor: {name: string}; input?: unknown}) {
+                    if (cmd.constructor.name === 'GetQueueUrlCommand') {
+                        return {
+                            QueueUrl: 'https://sqs.us-east-1.amazonaws.com/123456789012/my-test-queue',
+                        }
                     }
+                    if (cmd.constructor.name === 'GetQueueAttributesCommand') {
+                        return {
+                            Attributes: {
+                                QueueArn: 'arn:aws:sqs:us-east-1:123456789012:my-test-queue',
+                            },
+                        }
+                    }
+                    return {}
                 },
             } as never
 
             const adapter = new AwsServerlessAdapter(lambdaClient, undefined as never, undefined as never, sqsClient)
             const created = await adapter.createLambdaTrigger('hello', {
                 type: 'sqs',
-                queueNameOrUrl: 'https://sqs.us-east-1.amazonaws.com/000000000000/order-events',
+                queueNameOrUrl: 'my-test-queue',
                 batchSize: 10,
             })
 
             expect(created.type).toBe('sqs')
             expect(created.id).toBe('esm-sqs-1')
-            expect(created.sourceName).toBe('order-events')
+            expect(created.sourceName).toBe('my-test-queue')
             expect(createEsmInput).toMatchObject({
                 FunctionName: 'hello',
-                EventSourceArn: 'arn:aws:sqs:us-east-1:000000000000:order-events',
+                EventSourceArn: 'arn:aws:sqs:us-east-1:123456789012:my-test-queue',
                 BatchSize: 10,
             })
         })
 
-        test('deletes ESM trigger by UUID', async () => {
+        test('deletes ESM trigger by UUID after verifying function ownership', async () => {
             let deletedUuid: string | null = null
             const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'GetFunctionCommand') {
+                    return {
+                        Configuration: {
+                            FunctionName: 'hello',
+                            FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                        },
+                    }
+                }
+                if (cmd.constructor.name === 'GetEventSourceMappingCommand') {
+                    return {
+                        UUID: 'esm-123',
+                        FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                    }
+                }
                 if (cmd.constructor.name === 'DeleteEventSourceMappingCommand') {
                     deletedUuid = (cmd as {input: {UUID: string}}).input.UUID
                     return {}
@@ -413,16 +508,46 @@ describe('AwsServerlessAdapter', () => {
             expect(deletedUuid as string | null).toBe('esm-123')
         })
 
-        test('deletes S3 trigger by removing configuration', async () => {
-            const {client: lambdaClient} = stubLambda(() => ({}))
+        test('rejects ESM deletion when mapping belongs to another function', async () => {
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'GetFunctionCommand') {
+                    return {
+                        Configuration: {
+                            FunctionName: 'functionA',
+                            FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:functionA',
+                        },
+                    }
+                }
+                if (cmd.constructor.name === 'GetEventSourceMappingCommand') {
+                    return {
+                        UUID: 'esm-123',
+                        FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:functionB',
+                    }
+                }
+                return {}
+            })
+
+            const adapter = new AwsServerlessAdapter(lambdaClient)
+            await expect(
+                adapter.deleteLambdaTrigger('functionA', 'esm-123'),
+            ).rejects.toThrow('Event source mapping esm-123 does not belong to function functionA')
+        })
+
+        test('deletes S3 trigger by synthetic bucket-index and checks function ARN', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({
+                Configuration: {
+                    FunctionName: 'hello',
+                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                },
+            }))
             let putNotificationInput: unknown = null
             const s3Client = {
                 async send(cmd: {constructor: {name: string}; input?: unknown}) {
                     if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
                         return {
                             LambdaFunctionConfigurations: [
-                                {Id: 'keep-me', LambdaFunctionArn: 'arn:other'},
-                                {Id: 'delete-me', LambdaFunctionArn: 'arn:hello'},
+                                {LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello'},
+                                {Id: 'other-id', LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:other'},
                             ],
                         }
                     }
@@ -435,16 +560,43 @@ describe('AwsServerlessAdapter', () => {
             } as never
 
             const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
-            await adapter.deleteLambdaTrigger('hello', 'delete-me', {type: 's3', bucket: 'my-bucket'})
+            // Delete synthetic ID 'my-bucket-0'
+            await adapter.deleteLambdaTrigger('hello', 'my-bucket-0', {type: 's3', bucket: 'my-bucket'})
 
             expect(putNotificationInput).toMatchObject({
                 Bucket: 'my-bucket',
                 NotificationConfiguration: {
                     LambdaFunctionConfigurations: [
-                        {Id: 'keep-me', LambdaFunctionArn: 'arn:other'},
+                        {Id: 'other-id', LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:other'},
                     ],
                 },
             })
+        })
+
+        test('rejects S3 trigger deletion when trigger does not belong to target function', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({
+                Configuration: {
+                    FunctionName: 'hello',
+                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                },
+            }))
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}}) {
+                    if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
+                        return {
+                            LambdaFunctionConfigurations: [
+                                {Id: 'victim-trigger', LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:otherFunction'},
+                            ],
+                        }
+                    }
+                    return {}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            await expect(
+                adapter.deleteLambdaTrigger('hello', 'victim-trigger', {type: 's3', bucket: 'my-bucket'}),
+            ).rejects.toThrow('not found or does not belong to function hello')
         })
     })
 })

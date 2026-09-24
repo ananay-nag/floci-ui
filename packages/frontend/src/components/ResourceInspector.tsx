@@ -135,6 +135,7 @@ export function ResourceInspector({
       </div>
       {isLambda && resource.cloud === "aws" && showTriggers && (
         <LambdaTriggerPanel
+          key={resource.id}
           cloud={cloud ?? resource.cloud}
           resource={resource}
           runtimeReachable={runtimeReachable ?? false}

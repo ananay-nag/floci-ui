@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
@@ -55,6 +55,12 @@ export function LambdaTriggerPanel({
   const [isRegisterOpen, setIsRegisterOpen] = useState(initialRegisterOpen);
   const [selectedType, setSelectedType] = useState<TriggerType>("s3");
   const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  useEffect(() => {
+    resetForm();
+    setIsRegisterOpen(initialRegisterOpen);
+    setDeletingId(null);
+  }, [resource.id, initialRegisterOpen]);
 
   // Form State
   // S3

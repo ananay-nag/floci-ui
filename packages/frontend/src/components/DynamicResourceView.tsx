@@ -272,7 +272,6 @@ export function DynamicResourceView({
     for (const field of schemaQuery.data.updateFields) {
       const path = field.valuePath ?? field.name;
       const currentVal = getPath(editingResource, path);
-      console.log(currentVal)
       if (currentVal !== undefined && currentVal !== null) {
         vals[field.name] = currentVal;
       }
