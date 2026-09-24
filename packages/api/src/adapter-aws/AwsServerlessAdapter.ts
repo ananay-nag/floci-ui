@@ -12,7 +12,6 @@ import {
   ListEventSourceMappingsCommand,
   type ListEventSourceMappingsCommandOutput,
   ListFunctionsCommand,
-  RemovePermissionCommand,
   type LambdaClient,
 } from "@aws-sdk/client-lambda";
 import {
@@ -643,28 +642,6 @@ exports.handler = async (event) => {
             },
           }),
         );
-
-        // If no remaining triggers for this function on the bucket, remove permission
-        const hasOtherConfigsForBucket = filtered.some(
-          (c) =>
-            !fnArn ||
-            c.LambdaFunctionArn === fnArn ||
-            c.LambdaFunctionArn?.endsWith(`:${functionName}`) ||
-            c.LambdaFunctionArn === functionName,
-        );
-        if (!hasOtherConfigsForBucket) {
-          const statementId = `s3-trigger-${functionName}-${bucketName}`;
-          try {
-            await this.lambda.send(
-              new RemovePermissionCommand({
-                FunctionName: functionName,
-                StatementId: statementId,
-              }),
-            );
-          } catch {
-            // Ignore if permission cannot be removed or did not exist
-          }
-        }
         return;
       }
 
@@ -705,27 +682,6 @@ exports.handler = async (event) => {
                 },
               }),
             );
-
-            const hasOtherConfigsForBucket = filtered.some(
-              (c) =>
-                !fnArn ||
-                c.LambdaFunctionArn === fnArn ||
-                c.LambdaFunctionArn?.endsWith(`:${functionName}`) ||
-                c.LambdaFunctionArn === functionName,
-            );
-            if (!hasOtherConfigsForBucket) {
-              const statementId = `s3-trigger-${functionName}-${bucket.Name}`;
-              try {
-                await this.lambda.send(
-                  new RemovePermissionCommand({
-                    FunctionName: functionName,
-                    StatementId: statementId,
-                  }),
-                );
-              } catch {
-                // Ignore
-              }
-            }
             return;
           }
         } catch {

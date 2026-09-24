@@ -534,19 +534,12 @@ describe('AwsServerlessAdapter', () => {
         })
 
         test('deletes S3 trigger by synthetic bucket-index and checks function ARN', async () => {
-            let removePermissionInput: unknown = null
-            const {client: lambdaClient} = stubLambda((cmd) => {
-                if (cmd.constructor.name === 'RemovePermissionCommand') {
-                    removePermissionInput = (cmd as {input: unknown}).input
-                    return {}
-                }
-                return {
-                    Configuration: {
-                        FunctionName: 'hello',
-                        FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
-                    },
-                }
-            })
+            const {client: lambdaClient} = stubLambda(() => ({
+                Configuration: {
+                    FunctionName: 'hello',
+                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                },
+            }))
             let putNotificationInput: unknown = null
             const s3Client = {
                 async send(cmd: {constructor: {name: string}; input?: unknown}) {
@@ -577,10 +570,6 @@ describe('AwsServerlessAdapter', () => {
                         {Id: 'other-id', LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:other'},
                     ],
                 },
-            })
-            expect(removePermissionInput).toMatchObject({
-                FunctionName: 'hello',
-                StatementId: 's3-trigger-hello-my-bucket',
             })
         })
 
