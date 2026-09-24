@@ -1,30 +1,68 @@
 import {ValidationError} from '../cloud-spi/errors'
 import {
+  CreateEventSourceMappingCommand,
   CreateFunctionCommand,
+  DeleteEventSourceMappingCommand,
   DeleteFunctionCommand,
   GetFunctionCommand,
   InvokeCommand,
   type InvokeCommandOutput,
+  ListEventSourceMappingsCommand,
   ListFunctionsCommand,
   type LambdaClient,
 } from "@aws-sdk/client-lambda";
+import {
+  GetBucketNotificationConfigurationCommand,
+  type GetBucketNotificationConfigurationCommandOutput,
+  ListBucketsCommand,
+  PutBucketNotificationConfigurationCommand,
+  type S3Client,
+} from "@aws-sdk/client-s3";
+import {
+  DescribeTableCommand,
+  UpdateTableCommand,
+  type DynamoDBClient,
+} from "@aws-sdk/client-dynamodb";
+import {
+  GetQueueAttributesCommand,
+  type SQSClient,
+} from "@aws-sdk/client-sqs";
+import {
+  DescribeStreamSummaryCommand,
+  type KinesisClient,
+} from "@aws-sdk/client-kinesis";
 import { awsServerlessSchema } from "../cloud-spi/serverlessSchema";
 import type {
   CloudResource,
   CloudServiceAdapter,
+  CreateLambdaTriggerInput,
   CreateResourceInput,
+  DeleteLambdaTriggerOptions,
+  LambdaTrigger,
   ResourceQuery,
   ServerlessInvokeResult,
   ServiceSchema,
 } from "../cloud-spi/types";
-import { lambda as defaultLambda } from "../aws";
+import {
+  dynamodb as defaultDynamoDb,
+  kinesis as defaultKinesis,
+  lambda as defaultLambda,
+  s3 as defaultS3,
+  sqs as defaultSqs,
+} from "../aws";
 import { createZipArchive, handlerFileName } from "./zipArchive";
 
 export class AwsServerlessAdapter implements CloudServiceAdapter {
   readonly cloud = "aws" as const;
   readonly service = "serverless" as const;
 
-  constructor(private readonly lambda: LambdaClient = defaultLambda) {}
+  constructor(
+    private readonly lambda: LambdaClient = defaultLambda,
+    private readonly s3: S3Client = defaultS3,
+    private readonly dynamodb: DynamoDBClient = defaultDynamoDb,
+    private readonly sqs: SQSClient = defaultSqs,
+    private readonly kinesis: KinesisClient = defaultKinesis,
+  ) {}
 
   schema(): ServiceSchema {
     return awsServerlessSchema();
@@ -196,6 +234,394 @@ exports.handler = async (event) => {
       ...(res.LogResult ? { logResult: decodeLogResult(res.LogResult) } : {}),
       executionDuration,
     };
+  }
+
+  async listLambdaTriggers(functionName: string): Promise<LambdaTrigger[]> {
+    const triggers: LambdaTrigger[] = [];
+
+    // 1. Fetch Event Source Mappings (DynamoDB, SQS, Kinesis)
+    try {
+      const res = await this.lambda.send(
+        new ListEventSourceMappingsCommand({ FunctionName: functionName }),
+      );
+      for (const esm of res.EventSourceMappings ?? []) {
+        const arn = esm.EventSourceArn ?? "";
+        let type: 'dynamodb' | 'sqs' | 'kinesis' = 'dynamodb';
+        let sourceName = arn;
+
+        if (arn.includes(":dynamodb:") || arn.includes(":table/")) {
+          type = "dynamodb";
+          sourceName = arn.split(":table/")[1]?.split("/")[0] ?? arn;
+        } else if (arn.includes(":sqs:")) {
+          type = "sqs";
+          sourceName = arn.split(":").pop() ?? arn;
+        } else if (arn.includes(":kinesis:")) {
+          type = "kinesis";
+          sourceName = arn.split(":stream/")[1] ?? arn;
+        }
+
+        triggers.push({
+          id: esm.UUID ?? "",
+          type,
+          sourceArn: arn,
+          sourceName,
+          status: esm.State ?? "Enabled",
+          createdAt: esm.LastModified
+            ? (typeof esm.LastModified === "number"
+                ? new Date(esm.LastModified * 1000).toISOString()
+                : new Date(esm.LastModified).toISOString())
+            : null,
+          details: {
+            batchSize: esm.BatchSize,
+            startingPosition: esm.StartingPosition,
+            filterCriteria: esm.FilterCriteria?.Filters
+              ? { filters: esm.FilterCriteria.Filters }
+              : undefined,
+          },
+        });
+      }
+    } catch {
+      // Ignore ESM lookup errors
+    }
+
+    // 2. Fetch S3 Bucket Notifications targeting this Lambda
+    try {
+      const fnResource = await this.get(functionName);
+      const fnArn = (fnResource?.metadata?.arn as string) || "";
+      const bucketsRes = await this.s3.send(new ListBucketsCommand({}));
+
+      for (const bucket of bucketsRes.Buckets ?? []) {
+        if (!bucket.Name) continue;
+        try {
+          const config = await this.s3.send(
+            new GetBucketNotificationConfigurationCommand({ Bucket: bucket.Name }),
+          );
+          for (const [index, conf] of (config.LambdaFunctionConfigurations ?? []).entries()) {
+            const confArn = conf.LambdaFunctionArn ?? "";
+            const isMatch =
+              confArn === fnArn ||
+              confArn.endsWith(`:${functionName}`) ||
+              confArn === functionName;
+
+            if (isMatch) {
+              const prefix = conf.Filter?.Key?.FilterRules?.find(
+                (r) => r.Name?.toLowerCase() === "prefix",
+              )?.Value;
+              const suffix = conf.Filter?.Key?.FilterRules?.find(
+                (r) => r.Name?.toLowerCase() === "suffix",
+              )?.Value;
+
+              triggers.push({
+                id: conf.Id ?? `${bucket.Name}-${index}`,
+                type: "s3",
+                sourceArn: `arn:aws:s3:::${bucket.Name}`,
+                sourceName: bucket.Name,
+                status: "Active",
+                createdAt: bucket.CreationDate
+                  ? new Date(bucket.CreationDate).toISOString()
+                  : null,
+                details: {
+                  events: conf.Events ? [...conf.Events] : ["s3:ObjectCreated:*"],
+                  prefix,
+                  suffix,
+                },
+              });
+            }
+          }
+        } catch {
+          // Ignore individual bucket errors
+        }
+      }
+    } catch {
+      // Ignore S3 lookup errors
+    }
+
+    return triggers;
+  }
+
+  async createLambdaTrigger(
+    functionName: string,
+    input: CreateLambdaTriggerInput,
+  ): Promise<LambdaTrigger> {
+    if (!input.type) throw new ValidationError("Trigger type is required");
+
+    if (input.type === "s3") {
+      const bucketName = String(input.bucketName ?? "").trim();
+      if (!bucketName) throw new ValidationError("bucketName is required for S3 trigger");
+
+      const fn = await this.get(functionName);
+      const fnArn = (fn?.metadata?.arn as string) || `arn:aws:lambda:us-east-1:000000000000:function:${functionName}`;
+
+      const current = await this.s3
+        .send(new GetBucketNotificationConfigurationCommand({ Bucket: bucketName }))
+        .catch(() => ({} as GetBucketNotificationConfigurationCommandOutput));
+
+      const lambdaConfigs = [...(current.LambdaFunctionConfigurations ?? [])];
+      const triggerId = `lambda-trigger-${Date.now()}`;
+      const filterRules: Array<{ Name: "prefix" | "suffix"; Value: string }> = [];
+
+      if (input.prefix) filterRules.push({ Name: "prefix", Value: input.prefix });
+      if (input.suffix) filterRules.push({ Name: "suffix", Value: input.suffix });
+
+      lambdaConfigs.push({
+        Id: triggerId,
+        LambdaFunctionArn: fnArn,
+        Events: input.events && input.events.length > 0 ? (input.events as never) : ["s3:ObjectCreated:*"],
+        Filter: filterRules.length > 0 ? { Key: { FilterRules: filterRules } } : undefined,
+      });
+
+      await this.s3.send(
+        new PutBucketNotificationConfigurationCommand({
+          Bucket: bucketName,
+          NotificationConfiguration: {
+            ...current,
+            LambdaFunctionConfigurations: lambdaConfigs,
+          },
+        }),
+      );
+
+      return {
+        id: triggerId,
+        type: "s3",
+        sourceArn: `arn:aws:s3:::${bucketName}`,
+        sourceName: bucketName,
+        status: "Active",
+        createdAt: new Date().toISOString(),
+        details: {
+          events: input.events && input.events.length > 0 ? input.events : ["s3:ObjectCreated:*"],
+          prefix: input.prefix,
+          suffix: input.suffix,
+        },
+      };
+    }
+
+    if (input.type === "dynamodb") {
+      const tableName = String(input.tableName ?? "").trim();
+      if (!tableName) throw new ValidationError("tableName is required for DynamoDB trigger");
+
+      let streamArn = "";
+      let sourceName = tableName;
+
+      if (tableName.startsWith("arn:aws:dynamodb:") && tableName.includes("/stream/")) {
+        streamArn = tableName;
+        sourceName = tableName.split(":table/")[1]?.split("/")[0] ?? tableName;
+      } else {
+        sourceName = tableName;
+        try {
+          const desc = await this.dynamodb.send(
+            new DescribeTableCommand({ TableName: tableName }),
+          );
+          streamArn = desc.Table?.LatestStreamArn ?? "";
+
+          if (!streamArn) {
+            await this.dynamodb.send(
+              new UpdateTableCommand({
+                TableName: tableName,
+                StreamSpecification: {
+                  StreamEnabled: true,
+                  StreamViewType: "NEW_AND_OLD_IMAGES",
+                },
+              }),
+            );
+            const reDesc = await this.dynamodb.send(
+              new DescribeTableCommand({ TableName: tableName }),
+            );
+            streamArn = reDesc.Table?.LatestStreamArn ?? "";
+          }
+        } catch {
+          // If table describe/update fails, derive standard ARN format
+          streamArn = `arn:aws:dynamodb:us-east-1:000000000000:table/${tableName}/stream/${new Date().toISOString()}`;
+        }
+      }
+
+      if (!streamArn) {
+        streamArn = `arn:aws:dynamodb:us-east-1:000000000000:table/${tableName}/stream/${new Date().toISOString()}`;
+      }
+
+      const res = await this.lambda.send(
+        new CreateEventSourceMappingCommand({
+          FunctionName: functionName,
+          EventSourceArn: streamArn,
+          BatchSize: Number.isFinite(input.batchSize) ? input.batchSize : 100,
+          StartingPosition: input.startingPosition ?? "LATEST",
+          Enabled: input.enabled ?? true,
+        }),
+      );
+
+      return {
+        id: res.UUID ?? "",
+        type: "dynamodb",
+        sourceArn: streamArn,
+        sourceName,
+        status: res.State ?? "Enabled",
+        createdAt: new Date().toISOString(),
+        details: {
+          batchSize: res.BatchSize ?? input.batchSize ?? 100,
+          startingPosition: res.StartingPosition ?? input.startingPosition ?? "LATEST",
+        },
+      };
+    }
+
+    if (input.type === "sqs") {
+      const queueInput = String(input.queueNameOrUrl ?? "").trim();
+      if (!queueInput) throw new ValidationError("queueNameOrUrl is required for SQS trigger");
+
+      let queueArn = "";
+      let queueName = queueInput;
+
+      if (queueInput.startsWith("arn:aws:sqs:")) {
+        queueArn = queueInput;
+        queueName = queueInput.split(":").pop() ?? queueInput;
+      } else if (queueInput.startsWith("http://") || queueInput.startsWith("https://")) {
+        queueName = queueInput.split("/").pop() ?? queueInput;
+        try {
+          const attrs = await this.sqs.send(
+            new GetQueueAttributesCommand({
+              QueueUrl: queueInput,
+              AttributeNames: ["QueueArn"],
+            }),
+          );
+          queueArn = attrs.Attributes?.QueueArn ?? `arn:aws:sqs:us-east-1:000000000000:${queueName}`;
+        } catch {
+          queueArn = `arn:aws:sqs:us-east-1:000000000000:${queueName}`;
+        }
+      } else {
+        queueName = queueInput;
+        queueArn = `arn:aws:sqs:us-east-1:000000000000:${queueName}`;
+      }
+
+      const res = await this.lambda.send(
+        new CreateEventSourceMappingCommand({
+          FunctionName: functionName,
+          EventSourceArn: queueArn,
+          BatchSize: Number.isFinite(input.batchSize) ? input.batchSize : 10,
+          Enabled: input.enabled ?? true,
+        }),
+      );
+
+      return {
+        id: res.UUID ?? "",
+        type: "sqs",
+        sourceArn: queueArn,
+        sourceName: queueName,
+        status: res.State ?? "Enabled",
+        createdAt: new Date().toISOString(),
+        details: {
+          batchSize: res.BatchSize ?? input.batchSize ?? 10,
+        },
+      };
+    }
+
+    if (input.type === "kinesis") {
+      const streamInput = String(input.streamName ?? "").trim();
+      if (!streamInput) throw new ValidationError("streamName is required for Kinesis trigger");
+
+      let streamArn = "";
+      let streamName = streamInput;
+
+      if (streamInput.startsWith("arn:aws:kinesis:")) {
+        streamArn = streamInput;
+        streamName = streamInput.split(":stream/")[1] ?? streamInput;
+      } else {
+        streamName = streamInput;
+        try {
+          const desc = await this.kinesis.send(
+            new DescribeStreamSummaryCommand({ StreamName: streamName }),
+          );
+          streamArn = desc.StreamDescriptionSummary?.StreamARN ?? `arn:aws:kinesis:us-east-1:000000000000:stream/${streamName}`;
+        } catch {
+          streamArn = `arn:aws:kinesis:us-east-1:000000000000:stream/${streamName}`;
+        }
+      }
+
+      const res = await this.lambda.send(
+        new CreateEventSourceMappingCommand({
+          FunctionName: functionName,
+          EventSourceArn: streamArn,
+          BatchSize: Number.isFinite(input.batchSize) ? input.batchSize : 100,
+          StartingPosition: input.startingPosition ?? "LATEST",
+          Enabled: input.enabled ?? true,
+        }),
+      );
+
+      return {
+        id: res.UUID ?? "",
+        type: "kinesis",
+        sourceArn: streamArn,
+        sourceName: streamName,
+        status: res.State ?? "Enabled",
+        createdAt: new Date().toISOString(),
+        details: {
+          batchSize: res.BatchSize ?? input.batchSize ?? 100,
+          startingPosition: res.StartingPosition ?? input.startingPosition ?? "LATEST",
+        },
+      };
+    }
+
+    throw new ValidationError(`Unsupported trigger type: ${input.type}`);
+  }
+
+  async deleteLambdaTrigger(
+    functionName: string,
+    triggerId: string,
+    options?: DeleteLambdaTriggerOptions,
+  ): Promise<void> {
+    if (options?.type === "s3" || options?.bucket) {
+      const bucketName = options?.bucket;
+      if (bucketName) {
+        const config = await this.s3.send(
+          new GetBucketNotificationConfigurationCommand({ Bucket: bucketName }),
+        );
+        const filtered = (config.LambdaFunctionConfigurations ?? []).filter(
+          (c) => c.Id !== triggerId,
+        );
+        await this.s3.send(
+          new PutBucketNotificationConfigurationCommand({
+            Bucket: bucketName,
+            NotificationConfiguration: {
+              ...config,
+              LambdaFunctionConfigurations: filtered,
+            },
+          }),
+        );
+        return;
+      }
+
+      // If bucket not specified, search buckets
+      const bucketsRes = await this.s3.send(new ListBucketsCommand({}));
+      for (const bucket of bucketsRes.Buckets ?? []) {
+        if (!bucket.Name) continue;
+        try {
+          const config = await this.s3.send(
+            new GetBucketNotificationConfigurationCommand({ Bucket: bucket.Name }),
+          );
+          const found = (config.LambdaFunctionConfigurations ?? []).some(
+            (c) => c.Id === triggerId,
+          );
+          if (found) {
+            const filtered = (config.LambdaFunctionConfigurations ?? []).filter(
+              (c) => c.Id !== triggerId,
+            );
+            await this.s3.send(
+              new PutBucketNotificationConfigurationCommand({
+                Bucket: bucket.Name,
+                NotificationConfiguration: {
+                  ...config,
+                  LambdaFunctionConfigurations: filtered,
+                },
+              }),
+            );
+            return;
+          }
+        } catch {
+          // Ignore
+        }
+      }
+      return;
+    }
+
+    // Delete Event Source Mapping by UUID
+    await this.lambda.send(new DeleteEventSourceMappingCommand({ UUID: triggerId }));
   }
 }
 

@@ -195,4 +195,257 @@ describe('AwsServerlessAdapter', () => {
             expect(result.payload).toBe('')
         })
     })
+
+    describe('triggers', () => {
+        test('lists ESM triggers and S3 triggers for a function', async () => {
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd instanceof ListFunctionsCommand || (cmd as {constructor: {name: string}}).constructor.name === 'GetFunctionCommand') {
+                    return {
+                        Configuration: {
+                            FunctionName: 'hello',
+                            FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                        },
+                    }
+                }
+                return {
+                    EventSourceMappings: [
+                        {
+                            UUID: 'esm-123',
+                            EventSourceArn: 'arn:aws:dynamodb:us-east-1:000000000000:table/my-table/stream/2026-01-01',
+                            State: 'Enabled',
+                            BatchSize: 100,
+                            StartingPosition: 'LATEST',
+                        },
+                        {
+                            UUID: 'esm-456',
+                            EventSourceArn: 'arn:aws:sqs:us-east-1:000000000000:my-queue',
+                            State: 'Enabled',
+                            BatchSize: 10,
+                        },
+                    ],
+                }
+            })
+
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}; input?: {Bucket?: string}}) {
+                    if (cmd.constructor.name === 'ListBucketsCommand') {
+                        return {Buckets: [{Name: 'my-bucket', CreationDate: new Date('2026-01-01')}]}
+                    }
+                    if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
+                        return {
+                            LambdaFunctionConfigurations: [
+                                {
+                                    Id: 's3-trig-1',
+                                    LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                                    Events: ['s3:ObjectCreated:*'],
+                                    Filter: {
+                                        Key: {
+                                            FilterRules: [{Name: 'prefix', Value: 'uploads/'}],
+                                        },
+                                    },
+                                },
+                            ],
+                        }
+                    }
+                    return {}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            const triggers = await adapter.listLambdaTriggers('hello')
+
+            expect(triggers).toHaveLength(3)
+            expect(triggers[0]).toMatchObject({
+                id: 'esm-123',
+                type: 'dynamodb',
+                sourceName: 'my-table',
+                status: 'Enabled',
+            })
+            expect(triggers[1]).toMatchObject({
+                id: 'esm-456',
+                type: 'sqs',
+                sourceName: 'my-queue',
+                status: 'Enabled',
+            })
+            expect(triggers[2]).toMatchObject({
+                id: 's3-trig-1',
+                type: 's3',
+                sourceName: 'my-bucket',
+                status: 'Active',
+            })
+            expect(triggers[2].details.prefix).toBe('uploads/')
+        })
+
+        test('creates S3 trigger and updates bucket notification configuration', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({
+                Configuration: {
+                    FunctionName: 'hello',
+                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                },
+            }))
+
+            let putNotificationInput: unknown = null
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}; input?: unknown}) {
+                    if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
+                        return {LambdaFunctionConfigurations: []}
+                    }
+                    if (cmd.constructor.name === 'PutBucketNotificationConfigurationCommand') {
+                        putNotificationInput = cmd.input
+                        return {}
+                    }
+                    return {}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            const created = await adapter.createLambdaTrigger('hello', {
+                type: 's3',
+                bucketName: 'test-bucket',
+                events: ['s3:ObjectCreated:*'],
+                prefix: 'raw/',
+                suffix: '.json',
+            })
+
+            expect(created.type).toBe('s3')
+            expect(created.sourceName).toBe('test-bucket')
+            expect(created.details.prefix).toBe('raw/')
+            expect(created.details.suffix).toBe('.json')
+            expect(putNotificationInput).not.toBeNull()
+        })
+
+        test('creates DynamoDB trigger with stream discovery', async () => {
+            let createEsmInput: unknown = null
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'CreateEventSourceMappingCommand') {
+                    createEsmInput = (cmd as {input: unknown}).input
+                    return {
+                        UUID: 'esm-dynamo-1',
+                        State: 'Enabled',
+                        BatchSize: 100,
+                        StartingPosition: 'LATEST',
+                    }
+                }
+                return {}
+            })
+
+            const dynamoClient = {
+                async send() {
+                    return {
+                        Table: {
+                            LatestStreamArn: 'arn:aws:dynamodb:us-east-1:000000000000:table/users/stream/2026-01-01',
+                        },
+                    }
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, undefined as never, dynamoClient)
+            const created = await adapter.createLambdaTrigger('hello', {
+                type: 'dynamodb',
+                tableName: 'users',
+                batchSize: 50,
+            })
+
+            expect(created.type).toBe('dynamodb')
+            expect(created.id).toBe('esm-dynamo-1')
+            expect(created.sourceName).toBe('users')
+            expect(createEsmInput).toMatchObject({
+                FunctionName: 'hello',
+                EventSourceArn: 'arn:aws:dynamodb:us-east-1:000000000000:table/users/stream/2026-01-01',
+                BatchSize: 50,
+            })
+        })
+
+        test('creates SQS trigger with queue resolution', async () => {
+            let createEsmInput: unknown = null
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'CreateEventSourceMappingCommand') {
+                    createEsmInput = (cmd as {input: unknown}).input
+                    return {
+                        UUID: 'esm-sqs-1',
+                        State: 'Enabled',
+                        BatchSize: 10,
+                    }
+                }
+                return {}
+            })
+
+            const sqsClient = {
+                async send() {
+                    return {
+                        Attributes: {
+                            QueueArn: 'arn:aws:sqs:us-east-1:000000000000:order-events',
+                        },
+                    }
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, undefined as never, undefined as never, sqsClient)
+            const created = await adapter.createLambdaTrigger('hello', {
+                type: 'sqs',
+                queueNameOrUrl: 'https://sqs.us-east-1.amazonaws.com/000000000000/order-events',
+                batchSize: 10,
+            })
+
+            expect(created.type).toBe('sqs')
+            expect(created.id).toBe('esm-sqs-1')
+            expect(created.sourceName).toBe('order-events')
+            expect(createEsmInput).toMatchObject({
+                FunctionName: 'hello',
+                EventSourceArn: 'arn:aws:sqs:us-east-1:000000000000:order-events',
+                BatchSize: 10,
+            })
+        })
+
+        test('deletes ESM trigger by UUID', async () => {
+            let deletedUuid: string | null = null
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'DeleteEventSourceMappingCommand') {
+                    deletedUuid = (cmd as {input: {UUID: string}}).input.UUID
+                    return {}
+                }
+                return {}
+            })
+
+            const adapter = new AwsServerlessAdapter(lambdaClient)
+            await adapter.deleteLambdaTrigger('hello', 'esm-123')
+
+            expect(deletedUuid as string | null).toBe('esm-123')
+        })
+
+        test('deletes S3 trigger by removing configuration', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({}))
+            let putNotificationInput: unknown = null
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}; input?: unknown}) {
+                    if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
+                        return {
+                            LambdaFunctionConfigurations: [
+                                {Id: 'keep-me', LambdaFunctionArn: 'arn:other'},
+                                {Id: 'delete-me', LambdaFunctionArn: 'arn:hello'},
+                            ],
+                        }
+                    }
+                    if (cmd.constructor.name === 'PutBucketNotificationConfigurationCommand') {
+                        putNotificationInput = cmd.input
+                        return {}
+                    }
+                    return {}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            await adapter.deleteLambdaTrigger('hello', 'delete-me', {type: 's3', bucket: 'my-bucket'})
+
+            expect(putNotificationInput).toMatchObject({
+                Bucket: 'my-bucket',
+                NotificationConfiguration: {
+                    LambdaFunctionConfigurations: [
+                        {Id: 'keep-me', LambdaFunctionArn: 'arn:other'},
+                    ],
+                },
+            })
+        })
+    })
 })
+
