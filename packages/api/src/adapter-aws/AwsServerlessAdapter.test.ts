@@ -534,12 +534,19 @@ describe('AwsServerlessAdapter', () => {
         })
 
         test('deletes S3 trigger by synthetic bucket-index and checks function ARN', async () => {
-            const {client: lambdaClient} = stubLambda(() => ({
-                Configuration: {
-                    FunctionName: 'hello',
-                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
-                },
-            }))
+            let removePermissionInput: unknown = null
+            const {client: lambdaClient} = stubLambda((cmd) => {
+                if (cmd.constructor.name === 'RemovePermissionCommand') {
+                    removePermissionInput = (cmd as {input: unknown}).input
+                    return {}
+                }
+                return {
+                    Configuration: {
+                        FunctionName: 'hello',
+                        FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                    },
+                }
+            })
             let putNotificationInput: unknown = null
             const s3Client = {
                 async send(cmd: {constructor: {name: string}; input?: unknown}) {
@@ -571,6 +578,37 @@ describe('AwsServerlessAdapter', () => {
                     ],
                 },
             })
+            expect(removePermissionInput).toMatchObject({
+                FunctionName: 'hello',
+                StatementId: 's3-trigger-hello-my-bucket',
+            })
+        })
+
+        test('does not delete notification using index ID if notification already has an explicit stored ID', async () => {
+            const {client: lambdaClient} = stubLambda(() => ({
+                Configuration: {
+                    FunctionName: 'hello',
+                    FunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello',
+                },
+            }))
+            const s3Client = {
+                async send(cmd: {constructor: {name: string}}) {
+                    if (cmd.constructor.name === 'GetBucketNotificationConfigurationCommand') {
+                        return {
+                            LambdaFunctionConfigurations: [
+                                {Id: 'real-stored-id', LambdaFunctionArn: 'arn:aws:lambda:us-east-1:000000000000:function:hello'},
+                            ],
+                        }
+                    }
+                    return {}
+                },
+            } as never
+
+            const adapter = new AwsServerlessAdapter(lambdaClient, s3Client)
+            // Attempting to delete using 'my-bucket-0' when the config has 'real-stored-id' must fail
+            await expect(
+                adapter.deleteLambdaTrigger('hello', 'my-bucket-0', {type: 's3', bucket: 'my-bucket'}),
+            ).rejects.toThrow('not found or does not belong to function hello')
         })
 
         test('rejects S3 trigger deletion when trigger does not belong to target function', async () => {

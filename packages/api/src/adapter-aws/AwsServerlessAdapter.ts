@@ -12,6 +12,7 @@ import {
   ListEventSourceMappingsCommand,
   type ListEventSourceMappingsCommandOutput,
   ListFunctionsCommand,
+  RemovePermissionCommand,
   type LambdaClient,
 } from "@aws-sdk/client-lambda";
 import {
@@ -360,8 +361,8 @@ exports.handler = async (event) => {
       if (!fn) throw new NotFoundError(`Function ${functionName} not found`);
       const fnArn = (fn?.metadata?.arn as string) || `arn:aws:lambda:us-east-1:000000000000:function:${functionName}`;
 
-      // 1. Ensure invocation permission for S3
-      const statementId = `s3-trigger-${bucketName}-${Date.now()}`;
+      // 1. Ensure invocation permission for S3 with deterministic StatementId
+      const statementId = `s3-trigger-${functionName}-${bucketName}`;
       try {
         await this.lambda.send(
           new AddPermissionCommand({
@@ -618,7 +619,9 @@ exports.handler = async (event) => {
             c.LambdaFunctionArn === functionName;
           if (!isFuncMatch) continue;
 
-          if (c.Id === triggerId || `${bucketName}-${i}` === triggerId) {
+          // If config has stored Id, strictly match Id; if Id is absent, match synthetic index ID
+          const isIdMatch = c.Id ? c.Id === triggerId : `${bucketName}-${i}` === triggerId;
+          if (isIdMatch) {
             targetIndex = i;
             break;
           }
@@ -640,6 +643,28 @@ exports.handler = async (event) => {
             },
           }),
         );
+
+        // If no remaining triggers for this function on the bucket, remove permission
+        const hasOtherConfigsForBucket = filtered.some(
+          (c) =>
+            !fnArn ||
+            c.LambdaFunctionArn === fnArn ||
+            c.LambdaFunctionArn?.endsWith(`:${functionName}`) ||
+            c.LambdaFunctionArn === functionName,
+        );
+        if (!hasOtherConfigsForBucket) {
+          const statementId = `s3-trigger-${functionName}-${bucketName}`;
+          try {
+            await this.lambda.send(
+              new RemovePermissionCommand({
+                FunctionName: functionName,
+                StatementId: statementId,
+              }),
+            );
+          } catch {
+            // Ignore if permission cannot be removed or did not exist
+          }
+        }
         return;
       }
 
@@ -662,7 +687,8 @@ exports.handler = async (event) => {
               c.LambdaFunctionArn === functionName;
             if (!isFuncMatch) continue;
 
-            if (c.Id === triggerId || `${bucket.Name}-${i}` === triggerId) {
+            const isIdMatch = c.Id ? c.Id === triggerId : `${bucket.Name}-${i}` === triggerId;
+            if (isIdMatch) {
               targetIndex = i;
               break;
             }
@@ -679,6 +705,27 @@ exports.handler = async (event) => {
                 },
               }),
             );
+
+            const hasOtherConfigsForBucket = filtered.some(
+              (c) =>
+                !fnArn ||
+                c.LambdaFunctionArn === fnArn ||
+                c.LambdaFunctionArn?.endsWith(`:${functionName}`) ||
+                c.LambdaFunctionArn === functionName,
+            );
+            if (!hasOtherConfigsForBucket) {
+              const statementId = `s3-trigger-${functionName}-${bucket.Name}`;
+              try {
+                await this.lambda.send(
+                  new RemovePermissionCommand({
+                    FunctionName: functionName,
+                    StatementId: statementId,
+                  }),
+                );
+              } catch {
+                // Ignore
+              }
+            }
             return;
           }
         } catch {
