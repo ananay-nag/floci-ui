@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Check, ChevronDown, ChevronUp, Copy, Zap } from 'lucide-react'
 import { K8sEngineDetails } from "@/features/k8s/K8sEngineDetails";
@@ -36,6 +36,21 @@ export function ResourceInspector({
   const resourceCloud = cloud ?? resource?.cloud;
   const isAwsLambda = isLambda && resourceCloud === "aws";
 
+  useEffect(() => {
+    setCopiedJson(false);
+  }, [resource?.id, object?.key]);
+
+  const handleCopyJson = async (metadata: Record<string, unknown>) => {
+    try {
+      const text = JSON.stringify(metadata, null, 2);
+      await navigator.clipboard.writeText(text);
+      setCopiedJson(true);
+      setTimeout(() => setCopiedJson(false), 1500);
+    } catch {
+      setCopiedJson(false);
+    }
+  };
+
   const triggersQuery = useQuery({
     queryKey: ["lambda-triggers", resourceCloud, resource?.id],
     queryFn: ({ signal }) =>
@@ -61,10 +76,14 @@ export function ResourceInspector({
           <h3>{object.name}</h3>
           <span className="badge neutral">{object.type}</span>
         </div>
-        <div className="drawer-tabs">
+        <div className="drawer-tabs" role="tablist" aria-label="Metadata views">
           <button
             className={`drawer-tab ${activeTab === 'plain' ? 'active' : ''}`}
             type="button"
+            role="tab"
+            aria-selected={activeTab === 'plain'}
+            aria-controls="object-tabpanel-plain"
+            id="object-tab-plain"
             onClick={() => setActiveTab('plain')}
           >
             Plain Text
@@ -72,6 +91,10 @@ export function ResourceInspector({
           <button
             className={`drawer-tab ${activeTab === 'json' ? 'active' : ''}`}
             type="button"
+            role="tab"
+            aria-selected={activeTab === 'json'}
+            aria-controls="object-tabpanel-json"
+            id="object-tab-json"
             onClick={() => setActiveTab('json')}
           >
             JSON
@@ -79,28 +102,43 @@ export function ResourceInspector({
           <button
             className={`drawer-tab ${activeTab === 'table' ? 'active' : ''}`}
             type="button"
+            role="tab"
+            aria-selected={activeTab === 'table'}
+            aria-controls="object-tabpanel-table"
+            id="object-tab-table"
             onClick={() => setActiveTab('table')}
           >
             Table
           </button>
         </div>
         {activeTab === 'plain' && (
-          <div className="inspector-grid">
-            <InspectorItem label="Cloud" value={resource.cloud} />
-            <InspectorItem label="Resource" value={resource.name} />
-            <InspectorItem label="Key" value={object.key} />
-            <InspectorItem
-              label="Size"
-              value={object.size === null ? "-" : formatBytes(object.size)}
-            />
-            <InspectorItem
-              label="Last Modified"
-              value={object.lastModified ?? "-"}
-            />
+          <div
+            role="tabpanel"
+            id="object-tabpanel-plain"
+            aria-labelledby="object-tab-plain"
+          >
+            <div className="inspector-grid">
+              <InspectorItem label="Cloud" value={resource.cloud} />
+              <InspectorItem label="Resource" value={resource.name} />
+              <InspectorItem label="Key" value={object.key} />
+              <InspectorItem
+                label="Size"
+                value={object.size === null ? "-" : formatBytes(object.size)}
+              />
+              <InspectorItem
+                label="Last Modified"
+                value={object.lastModified ?? "-"}
+              />
+            </div>
           </div>
         )}
         {activeTab === 'json' && (
-          <div style={{ position: "relative" }}>
+          <div
+            role="tabpanel"
+            id="object-tabpanel-json"
+            aria-labelledby="object-tab-json"
+            style={{ position: "relative" }}
+          >
             <button
               className="button compact"
               type="button"
@@ -117,12 +155,7 @@ export function ResourceInspector({
                 padding: "2px 8px",
                 height: "24px",
               }}
-              onClick={() => {
-                const text = JSON.stringify(object.metadata, null, 2);
-                void navigator.clipboard.writeText(text);
-                setCopiedJson(true);
-                setTimeout(() => setCopiedJson(false), 1500);
-              }}
+              onClick={() => handleCopyJson(object.metadata)}
             >
               {copiedJson ? (
                 <Check size={12} style={{ color: "var(--status-ok)" }} />
@@ -140,7 +173,13 @@ export function ResourceInspector({
           </div>
         )}
         {activeTab === 'table' && (
-          <MetadataPanel metadata={object.metadata} />
+          <div
+            role="tabpanel"
+            id="object-tabpanel-table"
+            aria-labelledby="object-tab-table"
+          >
+            <MetadataPanel metadata={object.metadata} />
+          </div>
         )}
       </aside>
     );
@@ -214,10 +253,14 @@ export function ResourceInspector({
           onClose={() => setShowTriggers(false)}
         />
       )}
-      <div className="drawer-tabs">
+      <div className="drawer-tabs" role="tablist" aria-label="Metadata views">
         <button
           className={`drawer-tab ${activeTab === 'plain' ? 'active' : ''}`}
           type="button"
+          role="tab"
+          aria-selected={activeTab === 'plain'}
+          aria-controls="inspector-tabpanel-plain"
+          id="inspector-tab-plain"
           onClick={() => setActiveTab('plain')}
         >
           Plain Text
@@ -225,6 +268,10 @@ export function ResourceInspector({
         <button
           className={`drawer-tab ${activeTab === 'json' ? 'active' : ''}`}
           type="button"
+          role="tab"
+          aria-selected={activeTab === 'json'}
+          aria-controls="inspector-tabpanel-json"
+          id="inspector-tab-json"
           onClick={() => setActiveTab('json')}
         >
           JSON
@@ -232,6 +279,10 @@ export function ResourceInspector({
         <button
           className={`drawer-tab ${activeTab === 'table' ? 'active' : ''}`}
           type="button"
+          role="tab"
+          aria-selected={activeTab === 'table'}
+          aria-controls="inspector-tabpanel-table"
+          id="inspector-tab-table"
           onClick={() => setActiveTab('table')}
         >
           Table
@@ -239,7 +290,11 @@ export function ResourceInspector({
       </div>
 
       {activeTab === 'plain' && (
-        <>
+        <div
+          role="tabpanel"
+          id="inspector-tabpanel-plain"
+          aria-labelledby="inspector-tab-plain"
+        >
           <div className="inspector-grid">
             <InspectorItem label="Cloud" value={resource.cloud} />
             <InspectorItem label="Service" value={serviceName ?? resource.service} />
@@ -353,17 +408,16 @@ export function ResourceInspector({
               </div>
             </section>
           )}
-          {isLogGroup && cloud && (
-            <>
-              <LogsQueryPanel cloud={cloud} logGroupName={resource.id} runtimeReachable={runtimeReachable ?? false} />
-              <LogsExplorerPanel cloud={cloud} resource={resource} runtimeReachable={runtimeReachable ?? false} />
-            </>
-          )}
-        </>
+        </div>
       )}
 
       {activeTab === 'json' && (
-        <div style={{ position: "relative" }}>
+        <div
+          role="tabpanel"
+          id="inspector-tabpanel-json"
+          aria-labelledby="inspector-tab-json"
+          style={{ position: "relative" }}
+        >
           <button
             className="button compact"
             type="button"
@@ -380,12 +434,7 @@ export function ResourceInspector({
               padding: "2px 8px",
               height: "24px",
             }}
-            onClick={() => {
-              const text = JSON.stringify(resource.metadata, null, 2);
-              void navigator.clipboard.writeText(text);
-              setCopiedJson(true);
-              setTimeout(() => setCopiedJson(false), 1500);
-            }}
+            onClick={() => handleCopyJson(resource.metadata)}
           >
             {copiedJson ? (
               <Check size={12} style={{ color: "var(--status-ok)" }} />
@@ -404,7 +453,20 @@ export function ResourceInspector({
       )}
 
       {activeTab === 'table' && (
-        <MetadataPanel metadata={resource.metadata} />
+        <div
+          role="tabpanel"
+          id="inspector-tabpanel-table"
+          aria-labelledby="inspector-tab-table"
+        >
+          <MetadataPanel metadata={resource.metadata} />
+        </div>
+      )}
+
+      {isLogGroup && cloud && (
+        <>
+          <LogsQueryPanel cloud={cloud} logGroupName={resource.id} runtimeReachable={runtimeReachable ?? false} />
+          <LogsExplorerPanel cloud={cloud} resource={resource} runtimeReachable={runtimeReachable ?? false} />
+        </>
       )}
     </aside>
   );
