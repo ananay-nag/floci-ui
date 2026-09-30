@@ -165,4 +165,72 @@ describe('ResourceInspector Lambda Header and Triggers', () => {
 
         expect(screen.queryByRole('button', {name: /Register Trigger/i})).not.toBeInTheDocument()
     })
+
+    test('switches between Plain Text, JSON, and Table tabs', async () => {
+        const user = userEvent.setup()
+        renderWithClient(
+            <ResourceInspector
+                resource={longNamedLambda}
+                cloud="aws"
+                runtimeReachable={true}
+            />,
+        )
+
+        // Default tab is Plain Text
+        expect(screen.getByRole('button', {name: 'Plain Text'})).toHaveClass('active')
+        expect(screen.getByText('Lambda Details')).toBeInTheDocument()
+        expect(screen.getByText('Cloud')).toBeInTheDocument()
+
+        // Switch to JSON tab
+        const jsonTab = screen.getByRole('button', {name: 'JSON'})
+        await user.click(jsonTab)
+        expect(jsonTab).toHaveClass('active')
+        expect(screen.queryByText('Lambda Details')).not.toBeInTheDocument()
+        expect(screen.getByText(new RegExp(longNamedLambda.metadata.arn as string))).toBeInTheDocument()
+
+        // Switch to Table tab
+        const tableTab = screen.getByRole('button', {name: 'Table'})
+        await user.click(tableTab)
+        expect(tableTab).toHaveClass('active')
+        expect(screen.queryByText('Lambda Details')).not.toBeInTheDocument()
+        expect(screen.getByText('Arn')).toBeInTheDocument()
+
+        // Switch back to Plain Text tab
+        const plainTab = screen.getByRole('button', {name: 'Plain Text'})
+        await user.click(plainTab)
+        expect(plainTab).toHaveClass('active')
+        expect(screen.getByText('Lambda Details')).toBeInTheDocument()
+    })
+
+    test('copies JSON data to clipboard when Copy button is clicked in JSON tab', async () => {
+        const user = userEvent.setup()
+        const writeTextMock = vi.fn().mockResolvedValue(undefined)
+        Object.defineProperty(navigator, 'clipboard', {
+            value: {
+                writeText: writeTextMock,
+            },
+            configurable: true,
+        })
+
+        renderWithClient(
+            <ResourceInspector
+                resource={longNamedLambda}
+                cloud="aws"
+                runtimeReachable={true}
+            />,
+        )
+
+        // Switch to JSON tab
+        const jsonTab = screen.getByRole('button', {name: 'JSON'})
+        await user.click(jsonTab)
+
+        const copyButton = screen.getByRole('button', {name: /Copy/i})
+        expect(copyButton).toBeInTheDocument()
+
+        await user.click(copyButton)
+        expect(writeTextMock).toHaveBeenCalledWith(JSON.stringify(longNamedLambda.metadata, null, 2))
+        expect(await screen.findByText('Copied')).toBeInTheDocument()
+    })
 })
+
+

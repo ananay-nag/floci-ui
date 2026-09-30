@@ -3769,6 +3769,7 @@ button.console-service-card {
 .drawer-tab.active {
     color: var(--link);
     border-bottom-color: var(--link);
+    font-weight: 700;
 }
 
 /* ─── Object metadata display ────────────────────────────────────────────── */
